@@ -439,6 +439,34 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file::read_raw_at(void * ptr, size_t len, size_t offset) const {
+#ifdef _WIN32
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(len);
+    GGML_UNUSED(offset);
+    throw std::runtime_error("positional model reads are unavailable on this platform");
+#else
+    if (offset > size() || len > size() - offset) {
+        throw std::runtime_error("positional model read exceeds file bounds");
+    }
+    size_t done = 0;
+    while (done < len) {
+        const size_t chunk = std::min<size_t>(len - done, 64 * 1024 * 1024);
+        const ssize_t n = ::pread(file_id(), static_cast<char *>(ptr) + done,
+                                  chunk, static_cast<off_t>(offset + done));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(format("positional model read error: %s", strerror(errno)));
+        }
+        if (n == 0) {
+            throw std::runtime_error("unexpectedly reached end of model file");
+        }
+        done += static_cast<size_t>(n);
+    }
+#endif
+}
 #ifdef _WIN32
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else

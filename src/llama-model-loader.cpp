@@ -1566,8 +1566,8 @@ bool llama_model_loader::load_all_data(
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
-    // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
-    // NVMe raid configurations might require more / larger buffers.
+    // Four bounded slots overlap positional object-store reads and GPU uploads.
+    // mmap, tensor validation and aligned direct I/O retain their existing paths.
     constexpr size_t n_buffers = 4;
 
     size_t alignment = 1;
@@ -1575,14 +1575,45 @@ bool llama_model_loader::load_all_data(
         alignment = std::max(file->read_alignment(), alignment);
     }
 
-    // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    bool parallel_reads = !use_mmap && !check_tensors && alignment == 1;
+#ifdef _WIN32
+    parallel_reads = false;
+#endif
+    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment :
+                              parallel_reads ? 8 * 1024 * 1024 : 1 * 1024 * 1024;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
+    std::array<std::future<void>, n_buffers> reads;
     size_t buffer_idx = 0; // buffer to use for async loads
-    ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
+    ggml_backend_t upload_backend = nullptr;
+    // Cancellation and read errors must join readers and finish DMA before any
+    // pinned buffer is released, including a partially initialized backend.
+    struct upload_cleanup {
+        std::array<std::future<void>, n_buffers> & reads;
+        std::vector<ggml_backend_event_t> & events;
+        std::vector<ggml_backend_buffer_t> & buffers;
+        ggml_backend_t & backend;
+        ~upload_cleanup() {
+            for (auto & read : reads) {
+                if (read.valid()) {
+                    read.wait();
+                }
+            }
+            if (backend) {
+                ggml_backend_synchronize(backend);
+            }
+            for (auto * event : events) {
+                ggml_backend_event_free(event);
+            }
+            for (auto * buffer : buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            ggml_backend_free(backend);
+        }
+    } cleanup{reads, events, host_buffers, upload_backend};
+    upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
         }
@@ -1670,7 +1701,20 @@ bool llama_model_loader::load_all_data(
 
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
-    if (!use_mmap) {
+    if (parallel_reads && upload_backend) {
+        // Object-backed mounts benefit from monotonic reads, not tensor-size
+        // ordering. Missing/virtual weights sort last and remain skipped below.
+        std::stable_sort(tensors.begin(), tensors.end(), [this](const ggml_tensor * a, const ggml_tensor * b) {
+            const auto * wa = get_weight(ggml_get_name(a));
+            const auto * wb = get_weight(ggml_get_name(b));
+            if (!wa || !wb) {
+                return wa && !wb;
+            }
+            return wa->idx != wb->idx ? wa->idx < wb->idx : wa->offs < wb->offs;
+        });
+        LLAMA_LOG_INFO("%s: positional read pipeline: %zu slots x %zu MiB pinned\n", __func__,
+                       n_buffers, buffer_size / (1024 * 1024));
+    } else if (!use_mmap) {
         std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
             const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
             const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
@@ -1747,7 +1791,47 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (upload_backend && parallel_reads) {
+                    std::array<size_t, n_buffers> offsets{};
+                    std::array<size_t, n_buffers> sizes{};
+                    size_t submitted = 0;
+                    size_t consumed = 0;
+                    auto schedule = [&](size_t slot) {
+                        offsets[slot] = submitted;
+                        sizes[slot] = std::min(buffer_size, n_size - submitted);
+                        const size_t offset = weight->offs + submitted;
+                        const size_t size = sizes[slot];
+                        submitted += size;
+                        auto * source = file.get();
+                        auto * data = host_ptrs[slot];
+                        auto * event = events[slot];
+                        reads[slot] = std::async(std::launch::async, [source, data, event, offset, size] {
+                            // Only this slot's reader waits for its preceding
+                            // DMA. Other reads and the upload stream keep going.
+                            ggml_backend_event_synchronize(event);
+                            source->read_raw_at(data, size, offset);
+                        });
+                    };
+                    for (size_t slot = 0; slot < n_buffers && submitted < n_size; ++slot) {
+                        schedule(slot);
+                    }
+                    size_t slot = 0;
+                    while (consumed < n_size) {
+                        reads[slot].get(); // propagate short reads and I/O failures
+                        if (progress_callback && !progress_callback(
+                                static_cast<float>(size_done + consumed) / size_data,
+                                progress_callback_user_data)) {
+                            return false;
+                        }
+                        ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[slot], offsets[slot], sizes[slot]);
+                        ggml_backend_event_record(events[slot], upload_backend);
+                        consumed += sizes[slot];
+                        if (submitted < n_size) {
+                            schedule(slot);
+                        }
+                        slot = (slot + 1) % n_buffers;
+                    }
+                } else if (upload_backend) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1815,15 +1899,11 @@ bool llama_model_loader::load_all_data(
         size_done += n_size;
     }
 
-    // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
+    // Finish uploads before reporting completion. cleanup also covers every
+    // cancellation/error exit and releases readers, events, pinned buffers.
+    if (upload_backend) {
+        ggml_backend_synchronize(upload_backend);
     }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_backend_free(upload_backend);
 
     // check validation results
     bool validation_failed = false;
